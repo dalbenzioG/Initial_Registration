@@ -22,6 +22,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+GeometryMode = str
+
 
 def _matrix_to_list(mat: np.ndarray) -> list[list[float]]:
     return [[float(x) for x in row] for row in mat]
@@ -115,6 +117,67 @@ def _save_tfm_for_slicer(ras_matrix: np.ndarray, out_path: Path) -> None:
     sitk.WriteTransform(tx, str(out_path))
 
 
+def _registration_paths_and_labels_for_mode(
+    pair: dict[str, str], geometry_mode: GeometryMode, us_label: int, ct_label: int
+) -> tuple[str, str, int, int, str, str]:
+    """
+    Return (source_path, target_path, source_label, target_label, moving_modality, fixed_modality).
+
+    Note: CLI flags are named for the default run direction (US=source, CT=target). For the
+    direct CT->US mode we swap paths *and* swap labels so the user-provided intent is preserved.
+    """
+    if geometry_mode in ("us_to_ct", "ct_in_us_inverse"):
+        return (
+            pair["us_mask"],
+            pair["ct_mask"],
+            us_label,
+            ct_label,
+            "US",
+            "CT",
+        )
+    if geometry_mode == "ct_in_us_direct":
+        return (
+            pair["ct_mask"],
+            pair["us_mask"],
+            ct_label,
+            us_label,
+            "CT",
+            "US",
+        )
+    raise ValueError(f"Unsupported geometry_mode: {geometry_mode}")
+
+
+def _resample_mask_and_dice(
+    source_path: str,
+    target_path: str,
+    source_label: int,
+    target_label: int,
+    source_to_target_world: np.ndarray,
+) -> tuple[float, np.ndarray, np.ndarray]:
+    """
+    Compute Dice between (source resampled into target grid) and target binary masks.
+    Returns (dice, resampled_source_mask, target_mask).
+    """
+    source_mask, source_affine = _load_binary_mask(source_path, source_label)
+    target_mask, target_affine = _load_binary_mask(target_path, target_label)
+    moved_source_mask = _resample_source_mask_to_target_grid(
+        source_mask=source_mask,
+        source_affine=source_affine,
+        target_shape=target_mask.shape,
+        target_affine=target_affine,
+        source_to_target_world=source_to_target_world,
+    )
+    return _dice_coefficient(moved_source_mask, target_mask), moved_source_mask, target_mask
+
+
+def _save_resampled_mask(
+    resampled_mask: np.ndarray, target_path: str, out_path: Path
+) -> None:
+    ref_img = nib.load(target_path)
+    out_img = nib.Nifti1Image(resampled_mask.astype(np.uint8), ref_img.affine, header=ref_img.header)
+    nib.save(out_img, str(out_path))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run PCA + ICP registration on CT/US segmentation pairs.")
     parser.add_argument("--base_dir", type=Path, required=True, help="Dataset root with CT_masks and US_masks.")
@@ -130,15 +193,35 @@ def main() -> int:
     parser.add_argument("--icp_max_mean_distance", type=float, default=1e-3)
     parser.add_argument("--multistart_top_k", type=int, default=2)
     parser.add_argument(
+        "--geometry_mode",
+        type=str,
+        default="us_to_ct",
+        choices=["us_to_ct", "ct_in_us_inverse", "ct_in_us_direct"],
+        help=(
+            "Output geometry convention. "
+            "us_to_ct: register US->CT and evaluate on CT grid (default). "
+            "ct_in_us_inverse: register US->CT, invert transform, then resample CT onto US grid. "
+            "ct_in_us_direct: register CT->US directly, then resample CT onto US grid."
+        ),
+    )
+    parser.add_argument(
         "--save_tfm",
         action="store_true",
-        help="Save final US->CT transform as .tfm for Slicer.",
+        help="Save the transform matching the chosen geometry_mode as a .tfm for Slicer.",
     )
     parser.add_argument(
         "--transform_dir",
         type=Path,
         default=None,
         help="Directory for .tfm outputs (default: out_dir).",
+    )
+    parser.add_argument(
+        "--save_resampled_moving_nii",
+        action="store_true",
+        help=(
+            "Save a resampled binary mask in the output grid. "
+            "In ct_in_us_* modes this writes the CT mask expressed in US space."
+        ),
     )
     args = parser.parse_args()
 
@@ -169,37 +252,117 @@ def main() -> int:
     for case_id in sorted(dataset.keys()):
         pair = dataset[case_id]
         try:
-            result = register_nii_segmentations(
-                source_nii_path=pair["us_mask"],
-                target_nii_path=pair["ct_mask"],
-                config=config,
+            source_path, target_path, source_label, target_label, moving_modality, fixed_modality = (
+                _registration_paths_and_labels_for_mode(
+                    pair=pair,
+                    geometry_mode=args.geometry_mode,
+                    us_label=args.source_label,
+                    ct_label=args.target_label,
+                )
             )
 
-            source_mask, source_affine = _load_binary_mask(pair["us_mask"], args.source_label)
-            target_mask, target_affine = _load_binary_mask(pair["ct_mask"], args.target_label)
-            moved_source_mask = _resample_source_mask_to_target_grid(
-                source_mask=source_mask,
-                source_affine=source_affine,
-                target_shape=target_mask.shape,
-                target_affine=target_affine,
-                source_to_target_world=result.final_matrix,
+            run_config = RegistrationConfig(
+                source_label=source_label,
+                target_label=target_label,
+                smoothing_iterations=config.smoothing_iterations,
+                decimation_reduction=config.decimation_reduction,
+                pca_unstable_threshold=config.pca_unstable_threshold,
+                icp_mode=config.icp_mode,
+                icp_max_iterations=config.icp_max_iterations,
+                icp_max_landmarks=config.icp_max_landmarks,
+                icp_max_mean_distance=config.icp_max_mean_distance,
+                run_multistart_on_unstable_pca=config.run_multistart_on_unstable_pca,
+                multistart_top_k=config.multistart_top_k,
             )
-            dice_score = _dice_coefficient(moved_source_mask, target_mask)
+
+            result = register_nii_segmentations(
+                source_nii_path=source_path,
+                target_nii_path=target_path,
+                config=run_config,
+            )
+
+            if args.geometry_mode == "us_to_ct":
+                dice_score, moved_mask, fixed_mask = _resample_mask_and_dice(
+                    source_path=pair["us_mask"],
+                    target_path=pair["ct_mask"],
+                    source_label=args.source_label,
+                    target_label=args.target_label,
+                    source_to_target_world=result.final_matrix,
+                )
+                resample_source_path = pair["us_mask"]
+                resample_target_path = pair["ct_mask"]
+                resample_matrix = result.final_matrix
+                resample_matrix_name = "US_to_CT"
+                resample_moving_modality = "US"
+                resample_fixed_modality = "CT"
+            elif args.geometry_mode == "ct_in_us_inverse":
+                ct_to_us = np.linalg.inv(result.final_matrix)
+                dice_score, moved_mask, fixed_mask = _resample_mask_and_dice(
+                    source_path=pair["ct_mask"],
+                    target_path=pair["us_mask"],
+                    source_label=args.target_label,
+                    target_label=args.source_label,
+                    source_to_target_world=ct_to_us,
+                )
+                resample_source_path = pair["ct_mask"]
+                resample_target_path = pair["us_mask"]
+                resample_matrix = ct_to_us
+                resample_matrix_name = "CT_to_US"
+                resample_moving_modality = "CT"
+                resample_fixed_modality = "US"
+            elif args.geometry_mode == "ct_in_us_direct":
+                dice_score, moved_mask, fixed_mask = _resample_mask_and_dice(
+                    source_path=pair["ct_mask"],
+                    target_path=pair["us_mask"],
+                    source_label=args.target_label,
+                    target_label=args.source_label,
+                    source_to_target_world=result.final_matrix,
+                )
+                resample_source_path = pair["ct_mask"]
+                resample_target_path = pair["us_mask"]
+                resample_matrix = result.final_matrix
+                resample_matrix_name = "CT_to_US"
+                resample_moving_modality = "CT"
+                resample_fixed_modality = "US"
+            else:
+                raise ValueError(f"Unsupported geometry_mode: {args.geometry_mode}")
 
             tfm_path = None
             if args.save_tfm:
-                tfm_path = transform_dir / f"{case_id}_US_to_CT_pca_icp.tfm"
-                _save_tfm_for_slicer(result.final_matrix, tfm_path)
+                tfm_path = transform_dir / f"{case_id}_{resample_matrix_name}_pca_icp.tfm"
+                _save_tfm_for_slicer(resample_matrix, tfm_path)
+
+            resampled_moving_nii_path = None
+            if args.save_resampled_moving_nii:
+                # Save the mask that was actually resampled into the fixed grid.
+                # In ct_in_us_* modes this is the CT mask expressed in US space.
+                suffix = f"{resample_moving_modality}_mask_in_{resample_fixed_modality}_space"
+                resampled_moving_nii_path = args.out_dir / f"{case_id}_{suffix}.nii.gz"
+                _save_resampled_mask(moved_mask, resample_target_path, resampled_moving_nii_path)
 
             payload = {
                 "case_id": case_id,
+                "geometry_mode": args.geometry_mode,
+                "registration_moving_modality": moving_modality,
+                "registration_fixed_modality": fixed_modality,
+                "resample_moving_modality": resample_moving_modality,
+                "resample_fixed_modality": resample_fixed_modality,
+                "resample_transform_name": resample_matrix_name,
+                "registration_source_path": str(source_path),
+                "registration_target_path": str(target_path),
+                "resample_source_path": str(resample_source_path),
+                "resample_target_path": str(resample_target_path),
                 "best_candidate_name": result.best_candidate_name,
                 "best_candidate_score": float(result.best_candidate_score),
                 "dice_score": float(dice_score),
                 "pca_matrix": _matrix_to_list(result.pca_matrix),
                 "icp_matrix": _matrix_to_list(result.icp_matrix),
                 "final_matrix": _matrix_to_list(result.final_matrix),
+                "resample_matrix": _matrix_to_list(resample_matrix),
                 "final_transform_tfm_path": str(tfm_path) if tfm_path is not None else None,
+                "resampled_moving_nii_path": (
+                    str(resampled_moving_nii_path) if resampled_moving_nii_path is not None else None
+                ),
                 "candidate_scores": [
                     {
                         "candidate_name": s.candidate_name,
